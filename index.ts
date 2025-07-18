@@ -11,61 +11,342 @@ const STATIC_DIR = path.resolve(process.cwd(), "static");
 const GROUPS_DIR = path.join(STATIC_DIR, "groups");
 const TMP_DIR = path.resolve(process.cwd(), "tmp");
 
-// Создаём временную папку, если нет
+// Создаём временную папку для multer, если не существует
 fs.mkdir(TMP_DIR, { recursive: true }).catch(() => {});
 
 app.use(
   cors({
-    origin: ["http://localhost:5173"],
+    origin: ["http://localhost:5173", "http://localhost:4173"], // клиент Vite
     credentials: true,
   })
 );
 
+// Статичные файлы: доступ к /static
 app.use("/static", express.static(STATIC_DIR));
 
-// Multer загрузка в tmp, потом перемещение вручную
+// Настройка multer — загрузка во временную папку
 const tempStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    cb(null, TMP_DIR);
-  },
-  filename: (_req, file, cb) => {
-    cb(null, file.originalname);
-  },
+  destination: (_req, _file, cb) => cb(null, TMP_DIR),
+  filename: (_req, file, cb) => cb(null, file.originalname),
 });
 const upload = multer({ storage: tempStorage });
+/**
+ * GET /albumCover/:groupName/:albumTitle
+ * Возвращает файл обложки альбома
+ */
+app.get("/albumCovers/:groupName", async (req: Request, res: Response) => {
+  const { groupName } = req.params;
+  if (!groupName) {
+    return res.status(400).json({ error: "groupName обязателен" });
+  }
 
-// Загрузка обложки (пример)
+  const groupAlbumsDir = path.join(GROUPS_DIR, groupName, "Albums");
+
+  try {
+    await fs.access(groupAlbumsDir);
+    const albumDirs = await fs.readdir(groupAlbumsDir, { withFileTypes: true });
+
+    // Фильтруем только директории (альбомы)
+    const albums = albumDirs.filter((d) => d.isDirectory());
+
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+
+    // Проходим по каждой папке альбома и ищем cover.*
+    const covers = await Promise.all(
+      albums.map(async (albumDir) => {
+        const albumPath = path.join(groupAlbumsDir, albumDir.name);
+        const files = await fs.readdir(albumPath);
+        const coverFile = files.find((f) =>
+          f.toLowerCase().startsWith("cover.")
+        );
+        if (!coverFile) return null;
+
+        return {
+          albumTitle: albumDir.name,
+          coverUrl: `${baseUrl}/static/groups/${encodeURIComponent(
+            groupName
+          )}/Albums/${encodeURIComponent(albumDir.name)}/${encodeURIComponent(
+            coverFile
+          )}`,
+        };
+      })
+    );
+
+    // Убираем null (альбомы без обложек)
+    const filtered = covers.filter(
+      (c): c is { albumTitle: string; coverUrl: string } => c !== null
+    );
+
+    res.json(filtered);
+  } catch (e) {
+    console.error("Ошибка при получении обложек альбомов:", e);
+    res.status(404).json({ error: "Группа или альбомы не найдены" });
+  }
+});
+
+/**
+ * POST /uploadAlbum
+ * Создаёт папку static/groups/{groupName}/Albums/{albumTitle}
+ * и сохраняет в неё файл cover и все треки
+ * Ожидает поля:
+ *  - groupName: string
+ *  - title: string  (название альбома)
+ *  - файлы cover (name="cover") и tracks (name="tracks")
+ */
+app.post(
+  "/uploadAlbum",
+  upload.fields([
+    { name: "cover", maxCount: 1 },
+    { name: "tracks", maxCount: 100 },
+  ]),
+  async (req: Request, res: Response) => {
+    try {
+      const { groupName, title: albumTitle } = req.body;
+      if (!groupName || !albumTitle) {
+        return res.status(400).json({ error: "groupName и title обязательны" });
+      }
+
+      const files = req.files as {
+        cover?: Express.Multer.File[];
+        tracks?: Express.Multer.File[];
+      };
+
+      const coverFile = files.cover?.[0];
+      const trackFiles = files.tracks || [];
+
+      if (!coverFile) {
+        return res.status(400).json({ error: "Необходимо загрузить cover" });
+      }
+      if (trackFiles.length === 0) {
+        return res
+          .status(400)
+          .json({ error: "Необходимо загрузить хотя бы один трек" });
+      }
+
+      // Путь к папке Album
+      const albumDir = path.join(GROUPS_DIR, groupName, "Albums", albumTitle);
+      await fs.mkdir(albumDir, { recursive: true });
+
+      // Сохраняем cover
+      const coverExt = path.extname(coverFile.originalname);
+      const coverDest = path.join(albumDir, `cover${coverExt}`);
+      await fs.rename(coverFile.path, coverDest);
+
+      // Сохраняем треки
+      await Promise.all(
+        trackFiles.map((file) => {
+          const dest = path.join(albumDir, file.originalname);
+          return fs.rename(file.path, dest);
+        })
+      );
+
+      const baseUrl = `${req.protocol}://${req.get("host")}`;
+      const coverUrl = `${baseUrl}/static/groups/${groupName}/Albums/${encodeURIComponent(
+        albumTitle
+      )}/cover${coverExt}`;
+      const tracksUrls = trackFiles.map(
+        (f) =>
+          `${baseUrl}/static/groups/${groupName}/Albums/${encodeURIComponent(
+            albumTitle
+          )}/${encodeURIComponent(f.originalname)}`
+      );
+
+      return res.json({
+        message: "Альбом успешно загружен",
+        coverUrl,
+        tracksUrls,
+      });
+    } catch (error) {
+      console.error("Ошибка при загрузке альбома:", error);
+      return res.status(500).json({ error: "Внутренняя ошибка сервера" });
+    }
+  }
+);
+/**
+ * POST /uploadGroupCover
+ * Загрузка обложки группы
+ * Принимает файл "icon" и поле "groupName"
+ * Сохраняет в static/groups/{groupName}/cover.{ext}
+ * Возвращает url загруженной обложки
+ */
 app.post(
   "/uploadGroupCover",
   upload.single("icon"),
   async (req: Request, res: Response) => {
-    try {
-      if (!req.file) {
-        return res.status(400).json({ error: "icon file is required" });
-      }
-      const groupName = req.body.groupName;
-      if (!groupName) {
-        return res.status(400).json({ error: "groupName is missing" });
-      }
+    const groupName = req.body.groupName;
+    const file = req.file;
 
+    console.log(`[${new Date().toISOString()}] POST /uploadGroupCover called`);
+    console.log(`Received groupName: ${groupName}`);
+    console.log(`Received file: ${file ? file.originalname : "none"}`);
+
+    if (!groupName) {
+      console.warn(`[${new Date().toISOString()}] groupName is missing`);
+      return res.status(400).json({ error: "groupName is missing" });
+    }
+    if (!file) {
+      console.warn(`[${new Date().toISOString()}] icon file is missing`);
+      return res.status(400).json({ error: "icon file is required" });
+    }
+
+    try {
       const groupDir = path.join(GROUPS_DIR, groupName);
+      console.log(
+        `[${new Date().toISOString()}] Creating directory: ${groupDir}`
+      );
       await fs.mkdir(groupDir, { recursive: true });
 
-      const ext = path.extname(req.file.originalname);
+      // Удаляем все cover.* файлы
+      const files = await fs.readdir(groupDir);
+      const coverFiles = files.filter((f) => f.startsWith("cover."));
+      console.log(
+        `[${new Date().toISOString()}] Found cover files to delete: ${coverFiles.join(
+          ", "
+        )}`
+      );
+      await Promise.all(
+        coverFiles.map((fileName) =>
+          fs.unlink(path.join(groupDir, fileName)).catch((e) => {
+            console.error(
+              `[${new Date().toISOString()}] Error deleting file ${fileName}:`,
+              e
+            );
+          })
+        )
+      );
+
+      // Сохраняем новый файл
+      const ext = path.extname(file.originalname);
       const destPath = path.join(groupDir, `cover${ext}`);
+      console.log(
+        `[${new Date().toISOString()}] Moving uploaded file to: ${destPath}`
+      );
+      await fs.rename(file.path, destPath);
 
-      await fs.rename(req.file.path, destPath);
-
-      const url = `/static/groups/${groupName}/cover${ext}`;
-      console.log(`[${new Date().toISOString()}] Uploaded cover: ${url}`);
-
+      const url = `http://localhost:4001/static/groups/${groupName}/cover${ext}`;
+      console.log(`[${new Date().toISOString()}] Uploaded cover URL: ${url}`);
       res.json({ url });
-    } catch (error) {
-      console.error(error);
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Upload error:`, err);
       res.status(500).json({ error: "Internal server error" });
     }
   }
 );
+
+/**
+ * GET /tracks/:groupName
+ * Возвращает список треков группы с url для обложки и аудио
+ */
+app.get("/tracks/:groupName", async (req: Request, res: Response) => {
+  const { groupName } = req.params;
+  const { albumName } = req.query; // необязательный параметр
+
+  if (!groupName)
+    return res.status(400).json({ error: "groupName is required" });
+
+  const baseUrl = `${req.protocol}://${req.get("host")}`;
+  const tracksDir = path.join(GROUPS_DIR, groupName, "Tracks");
+
+  try {
+    await fs.access(tracksDir);
+
+    let dirs;
+    if (typeof albumName === "string" && albumName.trim() !== "") {
+      // Если albumName передан — читаем только папку альбома
+      const albumPath = path.join(tracksDir, albumName);
+      await fs.access(albumPath); // проверка существования
+
+      dirs = [{ name: albumName, isDirectory: () => true }];
+    } else {
+      // Иначе читаем все папки с треками
+      dirs = await fs.readdir(tracksDir, { withFileTypes: true });
+      dirs = dirs.filter((d) => d.isDirectory());
+    }
+
+    const tracks = await Promise.all(
+      dirs.map(async ({ name }) => {
+        const trackPath = path.join(tracksDir, name);
+        const files = await fs.readdir(trackPath);
+
+        const coverFile = files.find((f) =>
+          f.toLowerCase().startsWith("cover.")
+        );
+        const audioFile = files.find((f) => path.parse(f).name === name);
+
+        if (!audioFile) {
+          console.warn(`Audio file missing for track "${name}"`);
+          return null;
+        }
+
+        return {
+          trackName: name,
+          coverUrl: coverFile
+            ? `${baseUrl}/static/groups/${groupName}/Tracks/${name}/${coverFile}`
+            : null,
+          audioUrl: `${baseUrl}/static/groups/${groupName}/Tracks/${name}/${audioFile}`,
+        };
+      })
+    );
+
+    res.json(tracks.filter(Boolean));
+  } catch (e) {
+    console.error("Error reading tracks:", e);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+app.get(
+  "/album-tracks/:groupName/:albumName",
+  async (req: Request, res: Response) => {
+    const { groupName, albumName } = req.params;
+
+    if (!groupName || !albumName) {
+      return res
+        .status(400)
+        .json({ error: "groupName и albumName обязательны" });
+    }
+
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+    const albumDir = path.join(GROUPS_DIR, groupName, "Albums", albumName);
+
+    try {
+      // Проверяем существование папки альбома
+      await fs.access(albumDir);
+
+      // Список файлов внутри альбома
+      const files = await fs.readdir(albumDir);
+
+      // Ищем обложку — файл начинающийся с cover.
+      const coverFile = files.find((f) => f.toLowerCase().startsWith("cover."));
+      const coverUrl = coverFile
+        ? `${baseUrl}/static/groups/${groupName}/Albums/${albumName}/${coverFile}`
+        : null;
+
+      // Считаем треками все файлы аудио — например с расширениями mp3, wav и т.п.
+      // Фильтруем по расширениям аудио (можно добавить нужные)
+      const audioExtensions = [".mp3", ".wav", ".flac", ".ogg", ".m4a"];
+      const tracks = files
+        .filter((f) => audioExtensions.includes(path.extname(f).toLowerCase()))
+        .map((audioFile) => ({
+          trackName: path.parse(audioFile).name,
+          audioUrl: `${baseUrl}/static/groups/${groupName}/Albums/${albumName}/${audioFile}`,
+        }));
+
+      res.json({
+        albumName,
+        coverUrl,
+        tracks,
+      });
+    } catch (e) {
+      console.error("Error reading album tracks:", e);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+/**
+ * GET /groupCover/:groupName
+ * Отдаёт файл обложки группы
+ */
 app.get("/groupCover/:groupName", async (req: Request, res: Response) => {
   const { groupName } = req.params;
 
@@ -76,10 +357,8 @@ app.get("/groupCover/:groupName", async (req: Request, res: Response) => {
   const folderPath = path.join(GROUPS_DIR, groupName);
 
   try {
-    // Проверим, что папка существует
     await fs.access(folderPath);
 
-    // Найдем файл cover с любым расширением в папке
     const files = await fs.readdir(folderPath);
     const coverFile = files.find((f) => f.startsWith("cover."));
 
@@ -87,15 +366,21 @@ app.get("/groupCover/:groupName", async (req: Request, res: Response) => {
       return res.status(404).json({ error: "Cover image not found" });
     }
 
-    const filePath = path.join(folderPath, coverFile);
+    const coverUrl = `http://localhost:4001/static/groups/${groupName}/${coverFile}`;
 
-    // Отправляем сам файл с корректным Content-Type
-    return res.sendFile(filePath);
-  } catch (err) {
+    return res.json({ coverUrl });
+  } catch {
     return res.status(404).json({ error: "Group folder not found" });
   }
 });
-// Загрузка трека с обложкой
+
+/**
+ * POST /uploadTrack
+ * Загрузка трека с обложкой
+ * Принимает файлы "cover" и "audio" + поля groupName и trackName
+ * Создаёт папку static/groups/{groupName}/Tracks/{trackName}
+ * Сохраняет cover как cover.{ext}, audio с оригинальным именем
+ */
 app.post(
   "/uploadTrack",
   upload.fields([
@@ -104,24 +389,12 @@ app.post(
   ]),
   async (req: Request, res: Response) => {
     try {
-      console.log(
-        `[${new Date().toISOString()}] Запрос на загрузку трека получен`
-      );
-
-      const groupName = req.body.groupName;
-      const trackName = req.body.trackName;
-
-      console.log(
-        `Получены данные: groupName="${groupName}", trackName="${trackName}"`
-      );
+      const { groupName, trackName } = req.body;
 
       if (!groupName || !trackName) {
-        console.warn(
-          `[${new Date().toISOString()}] Ошибка: groupName и trackName обязательны`
-        );
-        return res
-          .status(400)
-          .json({ error: "groupName and trackName are required" });
+        return res.status(400).json({
+          error: "Необходимо указать имя группы и название трека",
+        });
       }
 
       const files = req.files as {
@@ -130,70 +403,46 @@ app.post(
       };
 
       if (!files?.cover?.[0] || !files?.audio?.[0]) {
-        console.warn(
-          `[${new Date().toISOString()}] Ошибка: отсутствуют cover или audio файлы`
-        );
-        return res
-          .status(400)
-          .json({ error: "cover and audio files are required" });
+        return res.status(400).json({
+          error: "Необходимы файлы обложки и аудио",
+        });
       }
 
-      console.log(
-        `Файлы получены: cover="${files.cover[0].originalname}", audio="${files.audio[0].originalname}"`
-      );
-
-      // Путь для трека
       const trackDir = path.join(GROUPS_DIR, groupName, "Tracks", trackName);
-      console.log(`Проверка существования папки для трека: ${trackDir}`);
 
       try {
-        // Проверяем существует ли папка
         await fs.access(trackDir);
-        // Если нет ошибки, значит папка существует
-        console.warn(
-          `[${new Date().toISOString()}] Ошибка: трек с таким названием уже существует`
-        );
-        return res
-          .status(409)
-          .json({ error: "Трек с таким названием уже существует" });
+        return res.status(409).json({
+          error: "Трек с таким названием уже существует",
+        });
       } catch {
-        // Ошибка доступа — значит папки нет, можно создавать
+        // Папки ещё не существует, всё ок
       }
 
-      // Создаем папку для трека
       await fs.mkdir(trackDir, { recursive: true });
 
-      // Перемещаем cover
       const coverFile = files.cover[0];
+      const audioFile = files.audio[0];
+
       const coverExt = path.extname(coverFile.originalname);
       const coverDest = path.join(trackDir, `cover${coverExt}`);
-      await fs.rename(coverFile.path, coverDest);
-      console.log(`Обложка перемещена в: ${coverDest}`);
-
-      // Перемещаем audio
-      const audioFile = files.audio[0];
       const audioDest = path.join(trackDir, audioFile.originalname);
-      await fs.rename(audioFile.path, audioDest);
-      console.log(`Аудио перемещено в: ${audioDest}`);
 
-      const coverUrl = `/static/groups/${groupName}/Tracks/${trackName}/cover${coverExt}`;
-      const audioUrl = `/static/groups/${groupName}/Tracks/${trackName}/${audioFile.originalname}`;
+      await Promise.all([
+        fs.rename(coverFile.path, coverDest),
+        fs.rename(audioFile.path, audioDest),
+      ]);
 
-      console.log(
-        `[${new Date().toISOString()}] Трек успешно загружен: ${trackName} для группы: ${groupName}`
-      );
-
-      res.json({
-        message: "Upload successful",
-        coverUrl,
-        audioUrl,
+      return res.json({
+        message: "Трек успешно загружен",
+        coverUrl: `http://localhost:4001/static/groups/${groupName}/Tracks/${trackName}/cover${coverExt}`,
+        audioUrl: `http://localhost:4001/static/groups/${groupName}/Tracks/${trackName}/${audioFile.originalname}`,
       });
     } catch (error) {
-      console.error(
-        `[${new Date().toISOString()}] Ошибка при загрузке трека:`,
-        error
-      );
-      res.status(500).json({ error: "Internal server error" });
+      console.error("Ошибка при загрузке трека:", error);
+      return res.status(500).json({
+        error: "Внутренняя ошибка сервера. Попробуйте позже",
+      });
     }
   }
 );
