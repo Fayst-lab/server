@@ -6,7 +6,7 @@
   "scripts": {
     "icon": "ts-node src/index.ts",
     "dev": "ts-node index.ts",
-    "start": "nodemon index.ts"
+    "start": "nodemon src/app.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

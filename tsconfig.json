@@ -10,5 +10,5 @@
     "resolveJsonModule": true,
     "outDir": "dist"
   },
-  "include": ["index.ts"]
+  "include": ["src/app.ts"]
 }
