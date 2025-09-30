@@ -8,6 +8,35 @@ import { buildUrl } from "../utils/buildUrl";
 
 export const trackRouter = Router();
 
+// Хелпер для построения пути и чтения папки с треками/альбомами
+async function readDirSafe(dir: string) {
+  try {
+    return await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+}
+
+// Хелпер для поиска аудио и обложки в папке
+async function getTrackFiles(baseDir: string, trackName: string | null = null) {
+  const files = await fs.readdir(baseDir);
+  const cover = files.find((f) => f.toLowerCase().startsWith("cover."));
+  let audio: string | undefined;
+
+  if (trackName) {
+    audio = files.find(
+      (f) =>
+        f.toLowerCase().endsWith(".mp3") &&
+        f.toLowerCase().includes(trackName.toLowerCase())
+    );
+  } else {
+    audio = files.find((f) => f.toLowerCase().endsWith(".mp3"));
+  }
+
+  return { cover, audio };
+}
+
+// Загрузка трека
 trackRouter.post(
   "/uploadTrack",
   upload.fields([{ name: "cover" }, { name: "audio" }]),
@@ -29,6 +58,7 @@ trackRouter.post(
       `cover${path.extname(cover.originalname)}`
     );
     const audioDest = path.join(dir, audio.originalname);
+
     await Promise.all([
       moveAndRename(cover.path, coverDest),
       moveAndRename(audio.path, audioDest),
@@ -56,19 +86,65 @@ trackRouter.post(
   }
 );
 
+// Получение всех треков из альбомов группы
+trackRouter.get("/allTracks/:groupName", async (req, res) => {
+  const groupName = req.params.groupName?.trim();
+  if (!groupName)
+    return res.status(400).json({ error: "groupName обязателен" });
+
+  const albumsDir = path.join(GROUPS_DIR, groupName, "Albums");
+  const albumEntries = await readDirSafe(albumsDir);
+  if (!albumEntries)
+    return res.status(404).json({ error: "Альбомы не найдены" });
+
+  const tracks = [];
+
+  for (const albumDir of albumEntries.filter((d) => d.isDirectory())) {
+    const albumPath = path.join(albumsDir, albumDir.name);
+    try {
+      const files = await fs.readdir(albumPath);
+      const cover = files.find((f) => f.toLowerCase().startsWith("cover."));
+      const audioFiles = files.filter((f) => f.toLowerCase().endsWith(".mp3"));
+
+      for (const audioFile of audioFiles) {
+        tracks.push({
+          trackName: path.parse(audioFile).name,
+          coverUrl: cover
+            ? buildUrl(req, "groups", groupName, "Albums", albumDir.name, cover)
+            : null,
+          audioUrl: buildUrl(
+            req,
+            "groups",
+            groupName,
+            "Albums",
+            albumDir.name,
+            audioFile
+          ),
+          albumName: albumDir.name,
+        });
+      }
+    } catch {
+      // Пропускаем альбом, если ошибка
+    }
+  }
+
+  res.json(tracks);
+});
+
+// Получение треков из Tracks или конкретного альбома
 trackRouter.get("/tracks/:groupName", async (req, res) => {
   const { groupName } = req.params;
-  const { albumName } = req.query as Record<string, string>;
+  const albumName = req.query.albumName as string | undefined;
+
+  let dirs;
   const baseDir = albumName
     ? path.join(GROUPS_DIR, groupName, "Tracks", albumName)
     : path.join(GROUPS_DIR, groupName, "Tracks");
 
-  let dirs;
-
   try {
     if (albumName) {
-      dirs = [{ name: albumName, isDirectory: () => true }];
       await fs.access(baseDir);
+      dirs = [{ name: albumName, isDirectory: () => true }];
     } else {
       const entries = await fs.readdir(baseDir, { withFileTypes: true });
       dirs = entries.filter((d) => d.isDirectory());
@@ -79,10 +155,10 @@ trackRouter.get("/tracks/:groupName", async (req, res) => {
 
   const tracks = await Promise.all(
     dirs.map(async ({ name }) => {
-      const files = await fs.readdir(path.join(baseDir, name));
-      const cover = files.find((f) => f.toLowerCase().startsWith("cover."));
-      const audio = files.find((f) => path.parse(f).name === name);
+      const trackDir = path.join(baseDir, name);
+      const { cover, audio } = await getTrackFiles(trackDir, name);
       if (!audio) return null;
+
       return {
         trackName: name,
         coverUrl: cover
@@ -95,6 +171,8 @@ trackRouter.get("/tracks/:groupName", async (req, res) => {
 
   res.json(tracks.filter(Boolean));
 });
+
+// Удаление трека
 trackRouter.delete("/deleteTrack/:groupName/:trackName", async (req, res) => {
   const { groupName, trackName } = req.params;
 
@@ -103,31 +181,23 @@ trackRouter.delete("/deleteTrack/:groupName/:trackName", async (req, res) => {
   }
 
   try {
-    // Формируем путь с учётом groupName
     const trackFolderPath = path.join(
       GROUPS_DIR,
       groupName,
       "Tracks",
       trackName
     );
-
-    console.log("Удаляем папку:", trackFolderPath);
-
-    // Удаляем папку трека рекурсивно, force: true — игнорирует отсутствие папки
     await fs.rm(trackFolderPath, { recursive: true, force: true });
-
     res.json({
-      message: `Папка трека "${trackName}" успешно удалена из Tracks группы "${groupName}"`,
+      message: `Трек "${trackName}" удалён из группы "${groupName}"`,
     });
   } catch (error) {
-    console.error("Ошибка при удалении папки трека из Tracks:", error);
-    res
-      .status(500)
-      .json({ error: "Ошибка сервера при удалении трека из Tracks" });
+    console.error("Ошибка при удалении трека:", error);
+    res.status(500).json({ error: "Ошибка сервера при удалении трека" });
   }
 });
-// в тот же файл trackRouter.ts
 
+// Получение информации о треке (из Tracks или Albums)
 trackRouter.get("/trackInfo/:groupName/:trackName", async (req, res) => {
   const { groupName, trackName } = req.params;
   const albumName = req.query.albumName as string | undefined;
@@ -137,120 +207,115 @@ trackRouter.get("/trackInfo/:groupName/:trackName", async (req, res) => {
   }
 
   try {
-    if (albumName) {
-      // Поиск только в указанном альбоме
-      const albumDir = path.join(GROUPS_DIR, groupName, "Albums", albumName);
-      try {
-        const files = await fs.readdir(albumDir);
-        const audio = files.find(
-          (f) =>
-            f.toLowerCase().endsWith(".mp3") &&
-            f.toLowerCase().includes(trackName.toLowerCase())
-        );
-        const cover = files.find((f) => f.toLowerCase().startsWith("cover."));
+    // Функция для поиска трека в указанной папке
+    async function findTrackInDir(baseDir: string, trackName: string) {
+      const files = await fs.readdir(baseDir);
+      const audio = files.find(
+        (f) =>
+          f.toLowerCase().endsWith(".mp3") &&
+          f.toLowerCase().includes(trackName.toLowerCase())
+      );
+      const cover = files.find((f) => f.toLowerCase().startsWith("cover."));
+      if (!audio) return null;
+      return { cover, audio };
+    }
 
-        if (audio) {
-          return res.json({
-            coverUrl: cover
-              ? buildUrl(req, "groups", groupName, "Albums", albumName, cover)
-              : null,
-            audioUrl: buildUrl(
+    if (albumName) {
+      const albumDir = path.join(GROUPS_DIR, groupName, "Albums", albumName);
+      const result = await findTrackInDir(albumDir, trackName);
+      if (!result)
+        return res.status(404).json({ error: "Трек не найден в альбоме" });
+      return res.json({
+        coverUrl: result.cover
+          ? buildUrl(
               req,
               "groups",
               groupName,
               "Albums",
               albumName,
-              audio
-            ),
-          });
-        }
-      } catch {
-        return res
-          .status(404)
-          .json({ error: "Трек не найден в указанном альбоме" });
-      }
-    } else {
-      // 1) Пытаемся найти в Tracks
-      try {
-        const trackDir = path.join(GROUPS_DIR, groupName, "Tracks", trackName);
-        const files = await fs.readdir(trackDir);
-        const cover = files.find((f) => f.toLowerCase().startsWith("cover."));
-        const audio = files.find(
-          (f) => path.extname(f).toLowerCase() === ".mp3"
-        );
-
-        if (audio) {
-          return res.json({
-            coverUrl: cover
-              ? buildUrl(req, "groups", groupName, "Tracks", trackName, cover)
-              : null,
-            audioUrl: buildUrl(
-              req,
-              "groups",
-              groupName,
-              "Tracks",
-              trackName,
-              audio
-            ),
-          });
-        }
-      } catch {
-        // Папки нет — пропускаем
-      }
-
-      // 2) Ищем во всех альбомах
-      const albumsDir = path.join(GROUPS_DIR, groupName, "Albums");
-      try {
-        const albums = await fs.readdir(albumsDir, { withFileTypes: true });
-
-        for (const alb of albums) {
-          if (!alb.isDirectory()) continue;
-          const albumDir = path.join(albumsDir, alb.name);
-          try {
-            const files = await fs.readdir(albumDir);
-            const audio = files.find(
-              (f) =>
-                f.toLowerCase().endsWith(".mp3") &&
-                f.toLowerCase().includes(trackName.toLowerCase())
-            );
-            const cover = files.find((f) =>
-              f.toLowerCase().startsWith("cover.")
-            );
-
-            if (audio) {
-              return res.json({
-                coverUrl: cover
-                  ? buildUrl(
-                      req,
-                      "groups",
-                      groupName,
-                      "Albums",
-                      alb.name,
-                      cover
-                    )
-                  : null,
-                audioUrl: buildUrl(
-                  req,
-                  "groups",
-                  groupName,
-                  "Albums",
-                  alb.name,
-                  audio
-                ),
-              });
-            }
-          } catch {
-            // папки не существует — пропускаем
-          }
-        }
-      } catch {
-        // Альбомов нет — ничего страшного
-      }
-
-      return res.status(404).json({ error: "Трек не найден" });
+              result.cover
+            )
+          : null,
+        audioUrl: buildUrl(
+          req,
+          "groups",
+          groupName,
+          "Albums",
+          albumName,
+          result.audio
+        ),
+      });
     }
-  } catch (err) {
-    console.error("Ошибка при получении информации о треке:", err);
-    return res.status(500).json({ error: "Серверная ошибка" });
+
+    // 1) Поиск в Tracks
+    const trackDir = path.join(GROUPS_DIR, groupName, "Tracks", trackName);
+    try {
+      const result = await findTrackInDir(trackDir, trackName);
+      if (result) {
+        return res.json({
+          coverUrl: result.cover
+            ? buildUrl(
+                req,
+                "groups",
+                groupName,
+                "Tracks",
+                trackName,
+                result.cover
+              )
+            : null,
+          audioUrl: buildUrl(
+            req,
+            "groups",
+            groupName,
+            "Tracks",
+            trackName,
+            result.audio
+          ),
+        });
+      }
+    } catch {
+      // пропускаем
+    }
+
+    // 2) Поиск по всем альбомам
+    const albumsDir = path.join(GROUPS_DIR, groupName, "Albums");
+    const albumEntries = await readDirSafe(albumsDir);
+    if (albumEntries) {
+      for (const albumDir of albumEntries.filter((d) => d.isDirectory())) {
+        const albumPath = path.join(albumsDir, albumDir.name);
+        try {
+          const result = await findTrackInDir(albumPath, trackName);
+          if (result) {
+            return res.json({
+              coverUrl: result.cover
+                ? buildUrl(
+                    req,
+                    "groups",
+                    groupName,
+                    "Albums",
+                    albumDir.name,
+                    result.cover
+                  )
+                : null,
+              audioUrl: buildUrl(
+                req,
+                "groups",
+                groupName,
+                "Albums",
+                albumDir.name,
+                result.audio
+              ),
+            });
+          }
+        } catch {
+          // пропускаем
+        }
+      }
+    }
+
+    return res.status(404).json({ error: "Трек не найден" });
+  } catch (error) {
+    console.error("Ошибка при получении информации о треке:", error);
+    res.status(500).json({ error: "Серверная ошибка" });
   }
 });
